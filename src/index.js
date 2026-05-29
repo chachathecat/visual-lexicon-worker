@@ -463,7 +463,7 @@ async function handleDebugFetch(env, limit, offset) {
   const v2Staged = await fetchCmsDataRaw(env, limit, offset, 'v2_staged');
   tests.push(buildDiagnostics(v2Staged, 'v2_staged'));
   const v1Legacy = await fetchCmsDataRaw(env, limit, offset, 'v1_legacy');
-  tests.push(buildDiagnostics(v1Legacy, 'v1_legacy');
+  tests.push(buildDiagnostics(v1Legacy, 'v1_legacy'));
   return jsonResponse({ ok: true, tests });
 }
 
