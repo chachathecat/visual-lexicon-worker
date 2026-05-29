@@ -207,215 +207,7 @@ function mergeRelationArrays(original, extracted) {
   (Array.isArray(extracted) ? extracted : []).forEach(v => { if (v) set.add(v); });
   return Array.from(set);
 }
-// Visual Lexicon staging worker for Session 2C
-//
-// This worker extends the Session 2B‑2 staging worker with chunked export
-// and finalisation endpoints.  It continues to use Webflow’s v2 API to
-// fetch CMS items, normalises them into a quiz‑pack schema, and writes
-// results into a staging R2 bucket without touching production routes.
-//
-// Key endpoints:
-//   GET /health
-//     – simple liveness check.
-//
-//   GET /admin/debug-webflow-fetch?limit=5&offset=0
-//     – attempts to fetch a small sample from Webflow via v2_live, v2_staged
-//       and v1_legacy endpoints and returns diagnostics (HTTP status,
-//       response keys, error messages, etc.).  Useful to verify API access.
-//
-//   GET /admin/debug-webflow-fields?limit=5&offset=0[&sample=spread]
-//     – fetches a sample of CMS items and exposes their top-level keys and
-//       fieldData keys/values for inspection.  Use this to understand
-//       available CMS fields before mapping.
-//
-//   GET /admin/test-webflow?limit=100&offset=0
-//     – validation endpoint: fetches up to `limit` CMS items, normalises
-//       them and writes a set of staging files (manifest/core/summary,
-//       word-index, per-word and per-hub).  Should be used only for
-//       small-scale tests; repeated calls will overwrite staging files.
-//
-//   GET /admin/export-webflow-chunk?runId=RUN&offset=0&limit=1000
-//     – chunked export endpoint: fetches a block of CMS items starting
-//       at `offset` with size `limit` (max 1000), normalises them and
-//       writes the chunk into run-specific folders in the staging bucket.
-//       A chunk manifest is also written summarising counts.  Per-word
-//       files are written into the run’s `words/` folder.  Does not
-//       overwrite the main staging quiz‑pack; instead builds up data
-//       for later finalisation.
-//
-//   GET /admin/finalize-export?runId=RUN
-//     – finalisation endpoint: reads all chunk files for the given runId,
-//       deduplicates words on slug, aggregates counts, constructs the
-//       final quiz‑pack files, per-word files and SEO files, writes them to
-//       the top-level staging prefix, and returns a summary.  WARNING: this
-//       may timeout on large datasets.
-//
-//   GET /admin/finalize-export-core?runId=RUN
-//     – core finalisation endpoint: aggregates all chunks, writes core/home
-//       datasets, manifest/summary, SEO files and per‑hub files.  It does not
-//       write per-word final files.
-//
-//   GET /admin/finalize-word-files-chunk?runId=RUN&chunkOffset=OFFSET
-//     – copies per‑word files from a single chunk into the final
-//       quiz‑pack/words prefix.  Call this separately for each chunk offset
-//       (e.g. 0, 1000, 2000…) after running finalize-export-core.
-//
-//   Note: All endpoints write only to the staging bucket and never touch
-//   production.
 
-// === Rich Text extraction and normalisation helpers ===
-// List of keys to consider when extracting rich text content from a CMS item.
-const RICH_TEXT_KEYS = ['blogContent', 'blog-content', 'richText', 'body', 'content', 'longDescription', 'article'];
-
-/**
- * Extract concatenated rich text content from known field keys. Returns a single
- * string containing the joined values of any matching fields.
- *
- * @param {object} fields
- * @returns {string}
- */
-function extractRichTextFromFields(fields) {
-  let rich = '';
-  for (const key of RICH_TEXT_KEYS) {
-    if (fields && fields[key]) {
-      const val = fields[key];
-      if (typeof val === 'string') {
-        rich += ' ' + val;
-      }
-    }
-  }
-  return rich.trim();
-}
-
-/**
- * Parse lexicon sections (definition, examples, synonyms, antonyms, related terms)
- * from a block of HTML or plain text.  This function attempts to detect headings
- * and section labels to categorise subsequent lines into appropriate arrays.
- *
- * @param {string} rawHtmlOrText
- * @returns {object} An object with keys: definition (string|null), examples (array), synonyms (array), antonyms (array), relatedTerms (array)
- */
-function extractLexiconSectionsFromRichText(rawHtmlOrText) {
-  if (!rawHtmlOrText || typeof rawHtmlOrText !== 'string') {
-    return { definition: null, examples: [], synonyms: [], antonyms: [], relatedTerms: [] };
-  }
-  // Convert HTML tags into newlines and strip any remaining tags.
-  let text = String(rawHtmlOrText)
-    .replace(/<\s*br\s*\/?>/gi, '\n')
-    .replace(/<\s*\/p\s*>/gi, '\n')
-    .replace(/<\s*p\b[^>]*>/gi, '')
-    .replace(/<\s*\/h[1-6]\s*>/gi, '\n')
-    .replace(/<\s*h[1-6]\b[^>]*>/gi, '\n')
-    .replace(/<[^>]+>/g, '');
-  // Normalise CRLF to LF
-  text = text.replace(/\r\n?/g, '\n');
-  const lines = text.split('\n').map(l => l.trim()).filter(l => l);
-  let current = null;
-  const definitionParts = [];
-  const examples = [];
-  const synonyms = [];
-  const antonyms = [];
-  const related = [];
-  // Helper to split a line into tokens and push into array
-  const pushTokens = (arr, line) => {
-    line.split(/[•\u2022\u2023\u25E6\-–—;,]/g).forEach(tok => {
-      const t = tok.trim();
-      if (t) arr.push(t);
-    });
-  };
-  for (const line of lines) {
-    const lower = line.toLowerCase();
-    if (/\bdefinition\b/.test(lower)) {
-      current = 'definition';
-      continue;
-    }
-    if (/\bexample\b/.test(lower)) {
-      current = 'examples';
-      continue;
-    }
-    if (/\bsynonym\b/.test(lower)) {
-      current = 'synonyms';
-      continue;
-    }
-    if (/\bantonym\b/.test(lower)) {
-      current = 'antonyms';
-      continue;
-    }
-    if (/\brelated\b/.test(lower)) {
-      current = 'related';
-      continue;
-    }
-    if (/^synonyms?:\s*/i.test(line)) {
-      current = 'synonyms';
-      pushTokens(synonyms, line.replace(/^synonyms?:\s*/i, ''));
-      continue;
-    }
-    if (/^antonyms?:\s*/i.test(line)) {
-      current = 'antonyms';
-      pushTokens(antonyms, line.replace(/^antonyms?:\s*/i, ''));
-      continue;
-    }
-    if (/^related\s*(terms|words)?:\s*/i.test(line)) {
-      current = 'related';
-      pushTokens(related, line.replace(/^related\s*(terms|words)?:\s*/i, ''));
-      continue;
-    }
-    // Depending on current section, push into appropriate arrays
-    if (current === 'definition') {
-      definitionParts.push(line);
-    } else if (current === 'examples') {
-      examples.push(line);
-    } else if (current === 'synonyms') {
-      pushTokens(synonyms, line);
-    } else if (current === 'antonyms') {
-      pushTokens(antonyms, line);
-    } else if (current === 'related') {
-      pushTokens(related, line);
-    }
-  }
-  // Helper to slugify and deduplicate terms
-  function slugifyTerms(arr) {
-    const out = [];
-    const seen = new Set();
-    for (const term of arr) {
-      const slug = toSlug(term);
-      if (slug && !seen.has(slug)) {
-        seen.add(slug);
-        out.push(slug);
-      }
-    }
-    return out;
-  }
-  return {
-    definition: definitionParts.join(' ').trim() || null,
-    examples: examples,
-    synonyms: slugifyTerms(synonyms),
-    antonyms: slugifyTerms(antonyms),
-    relatedTerms: slugifyTerms(related),
-  };
-}
-
-/**
- * Deduplicate an array of strings.
- * @param {Array<string>} arr
- * @returns {Array<string>}
- */
-function uniqueArray(arr) {
-  return Array.from(new Set((Array.isArray(arr) ? arr : []).filter(v => v)));
-}
-
-/**
- * Merge two relation arrays (e.g. synonyms) and deduplicate. Both arguments may be undefined.
- * @param {Array<string>} original
- * @param {Array<string>} extracted
- * @returns {Array<string>}
- */
-function mergeRelationArrays(original, extracted) {
-  const set = new Set();
-  (Array.isArray(original) ? original : []).forEach(v => { if (v) set.add(v); });
-  (Array.isArray(extracted) ? extracted : []).forEach(v => { if (v) set.add(v); });
-  return Array.from(set);
-}
 /**
  * Convert an arbitrary term into a slug suitable for use as a Word slug.
  * Lowercases, replaces non-alphanumeric characters with hyphens and trims hyphens.
@@ -534,8 +326,7 @@ export default {
       const limit = parseInt(url.searchParams.get('limit') || '1000', 10);
       return handleExportChunk(env, runId, offset, limit);
     }
-
-    // Serve staging files directly from R2 (read-only).  This makes it
+        // Serve staging files directly from R2 (read-only).  This makes it
     // possible to fetch JSON/XML files in the staging prefix via HTTP.
     if (url.pathname.startsWith('/staging/')) {
       return handleServeStaging(env, url.pathname);
@@ -657,6 +448,7 @@ export default {
     return jsonResponse({ ok: false, error: 'Not found' }, 404);
   },
 };
+
 // ============================================================================
 // Endpoint handlers
 // ============================================================================
@@ -670,7 +462,7 @@ async function handleDebugFetch(env, limit, offset) {
   tests.push(buildDiagnostics(v2Live,   'v2_live'));
   const v2Staged = await fetchCmsDataRaw(env, limit, offset, 'v2_staged');
   tests.push(buildDiagnostics(v2Staged, 'v2_staged'));
-  const v1Legacy = await fetchCmsDataRaw(env, limit, offset, 'v1_legacy');
+  const v1Legacy = await fetchCmsDataRaw(env, limit, offset, 'v1_legacy'));
   tests.push(buildDiagnostics(v1Legacy, 'v1_legacy'));
   return jsonResponse({ ok: true, tests });
 }
@@ -710,7 +502,6 @@ async function handleDebugWebflowFields(env, limit, offset, spread) {
     items: formatted,
   });
 }
-
 // Validation export handler: fetch small dataset, normalise and write to staging
 async function handleTestExport(env, limit, offset, origin) {
   if (!env.WEBFLOW_API_TOKEN || !env.WEBFLOW_COLLECTION_ID) {
@@ -873,7 +664,7 @@ async function handleFinalizeExport(env, runId, origin) {
   manifestEntries.sort((a, b) => a.offset - b.offset);
   // Aggregate all words and metrics
   const seen = new Map();
-    let totalFetched       = 0;
+  let totalFetched       = 0;
   let totalNormalized    = 0;
   let totalValid         = 0;
   let missingImage       = 0;
@@ -959,7 +750,7 @@ async function handleFinalizeExport(env, runId, origin) {
     uncategorizedCount,
     hubAssignmentMode: 'cms_hub_with_topic_fallback',
   };
-  const summaryFinal = {
+    const summaryFinal = {
     ok: true,
     totalCmsItems: totalFetched,
     normalized: totalNormalized,
@@ -1114,6 +905,308 @@ async function handleServeStaging(env, pathname) {
     });
   }
 }
+
+// Helper: read and parse the core words file if it exists.
+async function readCoreWords(env) {
+  if (!env.QUIZ_PACK) return [];
+  const key = 'staging/quiz-pack/core-v1.json';
+  const obj = await env.QUIZ_PACK.get(key);
+  if (!obj) return [];
+  try {
+    const text = await obj.text();
+    const words = JSON.parse(text);
+    return Array.isArray(words) ? words : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+// Compute basic counts for a list of words: total words, unique hubs, words with images.
+function computeCoreCounts(words) {
+  const hubs = new Set();
+  let images = 0;
+  for (const w of words) {
+    if (w && w.hub) hubs.add(w.hub);
+    if (w && w.image) images++;
+  }
+  return {
+    wordCount: words.length,
+    hubCount: hubs.size,
+    imageCount: images,
+  };
+}
+
+// List chunk manifest entries for a given run and return offsets and manifest data.
+async function listRunChunkManifests(env, runId) {
+  const manifests = [];
+  const prefix = `staging/runs/${runId}/chunk-manifests/`;
+  if (!env.QUIZ_PACK) return manifests;
+  let cursor;
+  do {
+    const listing = await env.QUIZ_PACK.list({ prefix, cursor });
+    for (const obj of listing.objects || []) {
+      const m = obj.key.match(/chunk-offset-(\d+)\.json$/);
+      const offset = m ? parseInt(m[1], 10) : 0;
+      // Read manifest file
+      const mf = await env.QUIZ_PACK.get(obj.key);
+      const text = mf ? await mf.text() : '{}';
+      let manifest;
+      try {
+        manifest = JSON.parse(text);
+      } catch (_) {
+        manifest = {};
+      }
+      manifests.push({ offset, manifest });
+    }
+    cursor = listing.cursor;
+  } while (cursor);
+  manifests.sort((a, b) => a.offset - b.offset);
+  return manifests;
+}
+// Status endpoint: returns run manifest details and which final files exist.
+async function handleFinalizeExportStatus(env, runId) {
+  if (!runId || runId.trim() === '') {
+    return jsonResponse({ ok: false, error: 'runId parameter is required' }, 400);
+  }
+  if (!env.QUIZ_PACK) {
+    return jsonResponse({ ok: false, error: 'Missing R2 binding (QUIZ_PACK)' }, 500);
+  }
+  // List chunk manifests
+  const manifests = await listRunChunkManifests(env, runId);
+  const chunkOffsets = manifests.map(m => m.offset);
+  // Determine next step based on existing files
+  const coreObj = await env.QUIZ_PACK.get('staging/quiz-pack/core-v1.json');
+  const slugObj = await env.QUIZ_PACK.get('staging/seo/slug-index.json');
+  const hubsObj = await env.QUIZ_PACK.get('staging/seo/hubs-v1.json');
+  const wordsSitemapObj = await env.QUIZ_PACK.get('staging/seo/words-sitemap.xml');
+  let nextStep = null;
+  if (chunkOffsets.length === 0) {
+    nextStep = 'export-chunks';
+  } else if (!coreObj) {
+    nextStep = 'build-core';
+  } else if (!slugObj || !hubsObj || !wordsSitemapObj) {
+    nextStep = 'build-seo-index';
+  } else {
+    nextStep = 'verify';
+  }
+  // Build counts summary from manifests
+  let totalFetched = 0;
+  let totalNormalized = 0;
+  let totalValid = 0;
+  for (const m of manifests) {
+    const man = m.manifest || {};
+    totalFetched += man.fetched || 0;
+    totalNormalized += man.normalized || 0;
+    totalValid += man.validQuizWords || 0;
+  }
+  return jsonResponse({
+    ok: true,
+    runId,
+    step: 'status',
+    counts: {
+      chunks: chunkOffsets.length,
+      totalFetched,
+      totalNormalized,
+      totalValidWords: totalValid,
+    },
+    createdFiles: [],
+    errors: [],
+    nextStep,
+    chunkOffsets,
+  });
+}
+
+// Verify endpoint: checks for existence of all expected staging files and returns counts.
+async function handleFinalizeExportVerify(env, runId) {
+  if (!runId || runId.trim() === '') {
+    return jsonResponse({ ok: false, error: 'runId parameter is required' }, 400);
+  }
+  if (!env.QUIZ_PACK) {
+    return jsonResponse({ ok: false, error: 'Missing R2 binding (QUIZ_PACK)' }, 500);
+  }
+  // Expected file keys
+  const expected = [
+    'staging/quiz-pack/core-v1.json',
+    'staging/quiz-pack/manifest.json',
+    'staging/quiz-pack/summary.json',
+    'staging/quiz-pack/home-v1.json',
+    'staging/seo/word-index.json',
+    'staging/seo/slug-index.json',
+    'staging/seo/hubs-v1.json',
+    'staging/seo/image-index.json',
+    'staging/seo/sitemap-index.xml',
+    'staging/seo/words-sitemap.xml',
+    'staging/seo/images-sitemap.xml',
+  ];
+  const missing = [];
+  for (const key of expected) {
+    const obj = await env.QUIZ_PACK.get(key);
+    if (!obj) missing.push(key);
+  }
+  // Compute counts if core exists
+  let counts = {};
+  const words = await readCoreWords(env);
+  if (words.length > 0) {
+    counts = computeCoreCounts(words);
+  }
+  return jsonResponse({
+    ok: missing.length === 0,
+    runId,
+    step: 'verify',
+    createdFiles: [],
+    counts,
+    errors: missing,
+    nextStep: missing.length === 0 ? null : 'build-core',
+  });
+}
+
+// Build core dataset (manifest, summary, core and home files).  This calls the
+// existing handleFinalizeExportCore function and returns a simplified summary.
+async function handleFinalizeExportBuildCore(env, runId, origin) {
+  if (!runId || runId.trim() === '') {
+    return jsonResponse({ ok: false, error: 'runId parameter is required' }, 400);
+  }
+  // Delegate to existing core handler
+  const resp = await handleFinalizeExportCore(env, runId, origin);
+  // Attempt to parse counts from response
+  let data;
+  try {
+    data = await resp.json();
+  } catch (_) {
+    data = null;
+  }
+  const createdFiles = [
+    'staging/quiz-pack/core-v1.json',
+    'staging/quiz-pack/manifest.json',
+    'staging/quiz-pack/summary.json',
+    'staging/quiz-pack/home-v1.json',
+    'staging/seo/word-index.json',
+    'staging/seo/related-edges.json',
+    'staging/seo/missing-related-report.json',
+  ];
+  const nextStep = 'build-seo-index';
+  return jsonResponse({
+    ok: data && data.ok,
+    runId,
+    step: 'build-core',
+    createdFiles,
+    counts: {
+      fetched: data ? data.fetched : undefined,
+      normalized: data ? data.normalized : undefined,
+      validQuizWords: data ? data.validQuizWords : undefined,
+    },
+    errors: data && data.ok ? [] : [data && data.error],
+    nextStep,
+    testUrls: data && data.testUrls,
+  });
+}
+
+// Build SEO index, hubs and sitemaps.
+async function handleFinalizeExportBuildSeoIndex(env, runId, origin) {
+  if (!runId || runId.trim() === '') {
+    return jsonResponse({ ok: false, error: 'runId parameter is required' }, 400);
+  }
+  if (!env.QUIZ_PACK) {
+    return jsonResponse({ ok: false, error: 'Missing R2 binding (QUIZ_PACK)' }, 500);
+  }
+  const words = await readCoreWords(env);
+  if (!words || words.length === 0) {
+    return jsonResponse({ ok: false, error: 'core dataset not found' }, 400);
+  }
+  // Build slug index
+  const slugIndex = words.map(w => ({
+    slug: w.slug,
+    hub: w.hub,
+    hubs: w.hubs,
+  }));
+  // Build hub map
+  const hubMap = {};
+  for (const w of words) {
+    const hubId = w.hub || 'uncategorized';
+    if (!hubMap[hubId]) hubMap[hubId] = [];
+    hubMap[hubId].push(w.slug);
+  }
+  // Convert to hubs list
+  const hubsList = [];
+  for (const hubId of Object.keys(hubMap)) {
+    hubsList.push({ hub: hubId, slugs: hubMap[hubId], count: hubMap[hubId].length });
+  }
+  // Build image index
+  const imageIndex = [];
+  for (const w of words) {
+    if (w.image) {
+      imageIndex.push({ slug: w.slug, image: w.image });
+    }
+  }
+  // Build words sitemap
+  function escapeXml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\\"/g, '&quot;')
+      .replace(/'/g, '&apos;');
+  }
+  const wordUrls = words.map(w => {
+    const loc = `${origin}/quiz/${encodeURIComponent(w.slug)}`;
+    return `  <url><loc>${escapeXml(loc)}</loc></url>`;
+  });
+  const wordsSitemapXml = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    ...wordUrls,
+    '</urlset>',
+  ].join('\n');
+  // Build images sitemap
+  const imageUrls = imageIndex.map(w => {
+    const loc = `${origin}/quiz/${encodeURIComponent(w.slug)}`;
+    const img = escapeXml(w.image);
+    return `  <url><loc>${escapeXml(loc)}</loc><image:image xmlns:image="http://www.google.com/schemas/sitemap-image/1.1"><image:loc>${img}</image:loc></image:image></url>`;
+  });
+  const imagesSitemapXml = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">',
+    ...imageUrls,
+    '</urlset>',
+  ].join('\n');
+  // Build sitemap index referencing both sitemaps
+  const sitemapIndexXml = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    `  <sitemap><loc>${origin}/staging/seo/words-sitemap.xml</loc></sitemap>`,
+    `  <sitemap><loc>${origin}/staging/seo/images-sitemap.xml</loc></sitemap>`,
+    '</sitemapindex>',
+  ].join('\n');
+    // Write files
+  await env.QUIZ_PACK.put('staging/seo/slug-index.json', JSON.stringify(slugIndex, null, 2));
+  await env.QUIZ_PACK.put('staging/seo/hubs-v1.json', JSON.stringify(hubsList, null, 2));
+  await env.QUIZ_PACK.put('staging/seo/image-index.json', JSON.stringify(imageIndex, null, 2));
+  await env.QUIZ_PACK.put('staging/seo/words-sitemap.xml', wordsSitemapXml);
+  await env.QUIZ_PACK.put('staging/seo/images-sitemap.xml', imagesSitemapXml);
+  await env.QUIZ_PACK.put('staging/seo/sitemap-index.xml', sitemapIndexXml);
+  const createdFiles = [
+    'staging/seo/slug-index.json',
+    'staging/seo/hubs-v1.json',
+    'staging/seo/image-index.json',
+    'staging/seo/words-sitemap.xml',
+    'staging/seo/images-sitemap.xml',
+    'staging/seo/sitemap-index.xml',
+  ];
+  return jsonResponse({
+    ok: true,
+    runId,
+    step: 'build-seo-index',
+    createdFiles,
+    counts: {
+      slugs: slugIndex.length,
+      hubs: hubsList.length,
+      images: imageIndex.length,
+    },
+    errors: [],
+    nextStep: 'verify',
+  });
+}
+
 // Build hub JSON files only.
 async function handleFinalizeExportBuildHubs(env, runId, origin) {
   if (!runId || runId.trim() === '') {
@@ -1391,3 +1484,42 @@ function generateExportIntegrityMarkdown(runId, stats) {
   lines.push(`- Hubs with few words (small hubs <5 words): **${stats.smallHubs.length}**`);
   lines.push('');
   lines.push(`## Missing or Invalid Fields`);
+  lines.push(`- Missing images: **${stats.missingImage.length}**`);
+  lines.push(`- Missing definitions: **${stats.missingDefinition.length}**`);
+  lines.push(`- Missing examples: **${stats.missingExample.length}**`);
+  lines.push(`- Missing hubs: **${stats.missingHub.length}**`);
+  lines.push(`- Invalid slugs/URLs: **${stats.invalidUrl.length}**`);
+  lines.push(`- Weak hub assignments: **${stats.weakHubAssignment.length}**`);
+  lines.push(`- Uncategorized words: **${stats.uncategorized.length}**`);
+  lines.push('');
+  lines.push(`## Duplicates`);
+  lines.push(`- Duplicate slugs: **${stats.duplicateSlugs.length}**`);
+  if (stats.duplicateSlugs.length > 0) {
+    lines.push(`  - ` + stats.duplicateSlugs.map(d => `\`${d.slug}\` (x${d.count})`).join(', '));
+  }
+  lines.push(`- Duplicate words: **${stats.duplicateWords.length}**`);
+  if (stats.duplicateWords.length > 0) {
+    lines.push(`  - ` + stats.duplicateWords.map(d => `\`${d.word}\` (x${d.count})`).join(', '));
+  }
+  lines.push('');
+  lines.push(`## Classification`);
+  lines.push(`- Index: **${stats.classificationCounts.index}**`);
+  lines.push(`- Pilot: **${stats.classificationCounts.pilot}**`);
+  lines.push(`- Noindex: **${stats.classificationCounts.noindex}**`);
+  lines.push('');
+  lines.push(`## Top Hubs by Word Count`);
+  lines.push(stats.topHubs.map(h => `- ${h.hub}: ${h.count}`).join('\n'));
+  lines.push('');
+  if (stats.smallHubs.length > 0) {
+    lines.push(`## Small Hubs (<5 words)`);
+    lines.push(stats.smallHubs.map(h => `- ${h.hub}: ${h.count}`).join('\n'));
+    lines.push('');
+  }
+  if (stats.missingImage.length > 0) {
+    lines.push(`## Words Missing Images (First 10)`);
+    const list = stats.missingImage.slice(0, 10).map(w => `- ${w.slug || w.word}`);
+    lines.push(list.join('\n'));
+    lines.push('');
+  }
+  return lines.join('\n');
+}
